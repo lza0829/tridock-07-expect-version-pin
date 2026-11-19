@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from app.db import connect
 from app.services import reconcile_service as svc
+from app.services.batch_evidence import batch_view
 
 router = APIRouter(tags=["reconcile"])
 
@@ -13,6 +14,8 @@ class RunIn(BaseModel):
 
 class SealIn(BaseModel):
     dock_day: str
+    batch_id: int | None = None
+    fingerprint: str | None = None
 
 
 class FateIn(BaseModel):
@@ -34,11 +37,15 @@ def run_reconcile(body: RunIn):
 def seal(body: SealIn):
     conn = connect()
     try:
-        return svc.seal_day(conn, body.dock_day)
+        return svc.seal_day(conn, body.dock_day, body.batch_id, body.fingerprint)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     finally:
         conn.close()
+
+
+def _batch_payload(conn, rows) -> list[dict]:
+    return [batch_view(conn, r) for r in rows]
 
 
 @router.get("/reconcile/batches")
@@ -51,7 +58,49 @@ def batches(dock_day: str | None = None):
             ).fetchall()
         else:
             rows = conn.execute("SELECT * FROM reconcile_batches ORDER BY id DESC").fetchall()
-        return [dict(r) for r in rows]
+        return _batch_payload(conn, rows)
+    finally:
+        conn.close()
+
+
+@router.get("/reconcile/batches/{batch_id}")
+def batch_detail(batch_id: int):
+    """批详情：批头（含封印快照）+ 对齐行 + 差额行。
+
+    结案成功的批次必须能在这里点开完整证据；查不到即 404。
+    """
+    conn = connect()
+    try:
+        batch = conn.execute(
+            "SELECT * FROM reconcile_batches WHERE id=?", (batch_id,)
+        ).fetchone()
+        if not batch:
+            raise HTTPException(404, f"对账批 {batch_id} 不存在")
+        data = batch_view(conn, batch)
+        data["matches"] = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM match_rows WHERE batch_id=? ORDER BY supplier_code, sku",
+                (batch_id,),
+            ).fetchall()
+        ]
+        data["variances"] = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM variance_rows WHERE batch_id=? ORDER BY supplier_code, sku",
+                (batch_id,),
+            ).fetchall()
+        ]
+        if batch["status"] == "sealed":
+            # 封印快照与实时明细必须一致，否则说明证据链被破坏。
+            data["evidence_consistent"] = (
+                batch["sealed_fingerprint"] == data["recomputed_fingerprint"]
+                and batch["sealed_match_count"] == batch["matched_count"]
+                and batch["sealed_variance_count"] == batch["variance_count"]
+            )
+        else:
+            data["evidence_consistent"] = None
+        return data
     finally:
         conn.close()
 

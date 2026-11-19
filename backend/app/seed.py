@@ -1,4 +1,5 @@
 from __future__ import annotations
+import sqlite3
 from app.db import connect
 
 SCHEMA = '''
@@ -49,7 +50,14 @@ CREATE TABLE IF NOT EXISTS reconcile_batches (
   matched_count INTEGER NOT NULL,
   variance_count INTEGER NOT NULL,
   status TEXT NOT NULL,
+  created_at TEXT,
+  fingerprint TEXT NOT NULL DEFAULT '',
   sealed_at TEXT,
+  sealed_by TEXT,
+  sealed_fingerprint TEXT,
+  sealed_match_count INTEGER,
+  sealed_variance_count INTEGER,
+  superseded_at TEXT,
   note TEXT
 );
 CREATE TABLE IF NOT EXISTS match_rows (
@@ -87,11 +95,40 @@ CREATE TABLE IF NOT EXISTS reopen_requests (
 );
 '''
 
+# 旧库升级：reconcile_batches 缺的列在此补齐。
+_BATCH_COLUMNS = {
+    "created_at": "TEXT",
+    "fingerprint": "TEXT NOT NULL DEFAULT ''",
+    "sealed_by": "TEXT",
+    "sealed_fingerprint": "TEXT",
+    "sealed_match_count": "INTEGER",
+    "sealed_variance_count": "INTEGER",
+    "superseded_at": "TEXT",
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(reconcile_batches)")}
+    for name, decl in _BATCH_COLUMNS.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE reconcile_batches ADD COLUMN {name} {decl}")
+    # 每一天最多一个 sealed 批：并发结案的最后一道硬约束。
+    try:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_reconcile_batches_sealed "
+            "ON reconcile_batches(dock_day) WHERE status='sealed'"
+        )
+    except sqlite3.IntegrityError:
+        # 历史数据里已有同日多封，保留现状；应用层仍会拒绝双封。
+        pass
+    conn.commit()
+
 
 def seed_if_empty() -> None:
     conn = connect()
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         if conn.execute("SELECT COUNT(*) c FROM suppliers").fetchone()["c"]:
             return
         conn.execute("INSERT INTO settings(key, value) VALUES ('dock_day', ?)", ("2026-11-18",))
